@@ -25,17 +25,98 @@ jobs:
         with:
           python-version: '3.11'
  
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+ 
       - name: Install pip-audit
         run: pip install pip-audit
  
       - name: Install project dependencies
-        run: pip install .
+        # Use CPU-only wheels for torch and a prebuilt wheel for
+        # llama-cpp-python to avoid a slow CUDA download / source build.
+        # We only need these installed so pip-audit can see their versions.
+        run: |
+          pip install \
+            --extra-index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu \
+            .
  
       - name: Run pip-audit
         run: |
           pip-audit \
-            -f sarif \
-            -o pip-audit-results.sarif
+            -f json \
+            -o pip-audit-results.json
+        continue-on-error: true
+ 
+      - name: Convert pip-audit JSON to SARIF
+        run: |
+          python - <<'PYEOF'
+          import json
+ 
+          with open("pip-audit-results.json") as f:
+              data = json.load(f)
+ 
+          rules = {}
+          results = []
+ 
+          for dep in data.get("dependencies", []):
+              name = dep.get("name", "unknown")
+              version = dep.get("version", "unknown")
+              for vuln in dep.get("vulns", []):
+                  vuln_id = vuln.get("id", "UNKNOWN")
+                  fix_versions = ", ".join(vuln.get("fix_versions", [])) or "no fix available"
+                  description = vuln.get("description", "No description provided.")
+ 
+                  if vuln_id not in rules:
+                      rules[vuln_id] = {
+                          "id": vuln_id,
+                          "name": vuln_id,
+                          "shortDescription": {"text": f"{vuln_id} in {name}"},
+                          "fullDescription": {"text": description[:500]},
+                          "helpUri": f"https://osv.dev/vulnerability/{vuln_id}",
+                          "properties": {"security-severity": "7.0"},
+                      }
+ 
+                  results.append({
+                      "ruleId": vuln_id,
+                      "level": "error",
+                      "message": {
+                          "text": f"{name}=={version} is affected by {vuln_id}. "
+                                  f"Fix versions: {fix_versions}."
+                      },
+                      "locations": [{
+                          "physicalLocation": {
+                              "artifactLocation": {"uri": "pyproject.toml"},
+                              "region": {"startLine": 1}
+                          }
+                      }]
+                  })
+ 
+          sarif = {
+              "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "pip-audit",
+                          "informationUri": "https://github.com/pypa/pip-audit",
+                          "rules": list(rules.values()),
+                      }
+                  },
+                  "results": results,
+              }],
+          }
+ 
+          with open("pip-audit-results.sarif", "w") as f:
+              json.dump(sarif, f, indent=2)
+ 
+          print(f"Converted {len(results)} finding(s) to SARIF.")
+          PYEOF
         continue-on-error: true
  
       - name: Upload pip-audit SARIF
@@ -52,7 +133,7 @@ jobs:
         uses: actions/checkout@v4
  
       - name: Run Trivy filesystem scan
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -94,7 +175,7 @@ jobs:
  
       - name: Run Trivy image scan
         if: steps.dockerfile.outputs.exists == 'true'
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: image
           image-ref: llmgoat:scan
@@ -111,7 +192,7 @@ jobs:
           category: trivy-image
  
       - name: Generate SBOM (CycloneDX)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
