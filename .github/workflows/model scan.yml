@@ -1,0 +1,256 @@
+name: Model Scan Security Scan
+ 
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main]
+  workflow_dispatch:
+ 
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: write
+ 
+jobs:
+  modelscan:
+    name: Model Scan - ModelScan (known-bad operators)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+ 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+ 
+      - name: Install ModelScan
+        run: pip install modelscan
+ 
+      - name: Run ModelScan against models directory
+        run: |
+          if [ -d "models" ]; then
+            modelscan -p models -r json -o modelscan-results.json
+          else
+            echo "No models directory found, skipping."
+            echo '{"summary": {"total_issues": 0}, "issues": [], "errors": []}' > modelscan-results.json
+          fi
+        continue-on-error: true
+ 
+      - name: Convert ModelScan JSON to SARIF
+        run: |
+          python - <<'PYEOF'
+          import json
+ 
+          with open("modelscan-results.json") as f:
+              data = json.load(f)
+ 
+          severity_map = {
+              "CRITICAL": "error",
+              "HIGH": "error",
+              "MEDIUM": "warning",
+              "LOW": "note",
+          }
+ 
+          rules = {}
+          results = []
+ 
+          for issue in data.get("issues", []):
+              rule_id = f"modelscan-{issue.get('module', 'unknown')}-{issue.get('operator', 'unknown')}"
+              description = issue.get("description", "Unsafe operator detected in model file.")
+              source = issue.get("source", "unknown")
+              severity = issue.get("severity", "MEDIUM")
+ 
+              if rule_id not in rules:
+                  rules[rule_id] = {
+                      "id": rule_id,
+                      "name": rule_id,
+                      "shortDescription": {"text": description[:120]},
+                      "fullDescription": {"text": description},
+                      "helpUri": "https://github.com/protectai/modelscan",
+                      "properties": {"security-severity": "9.0" if severity == "CRITICAL" else "6.0"},
+                  }
+ 
+              results.append({
+                  "ruleId": rule_id,
+                  "level": severity_map.get(severity, "warning"),
+                  "message": {"text": description},
+                  "locations": [{
+                      "physicalLocation": {
+                          "artifactLocation": {"uri": source},
+                          "region": {"startLine": 1}
+                      }
+                  }]
+              })
+ 
+          sarif = {
+              "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "ModelScan",
+                          "informationUri": "https://github.com/protectai/modelscan",
+                          "rules": list(rules.values()),
+                      }
+                  },
+                  "results": results,
+              }],
+          }
+ 
+          with open("modelscan-results.sarif", "w") as f:
+              json.dump(sarif, f, indent=2)
+ 
+          print(f"Converted {len(results)} ModelScan finding(s) to SARIF.")
+          PYEOF
+        continue-on-error: true
+ 
+      - name: Upload ModelScan SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: modelscan-results.sarif
+          category: modelscan
+ 
+  fickling:
+    name: Model Scan - Fickling (pickle opcode analysis)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+ 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+ 
+      - name: Install Fickling
+        run: pip install fickling
+ 
+      - name: Find pickle files and run Fickling on each
+        run: |
+          mkdir -p fickling-reports
+          finding_count=0
+ 
+          if [ -d "models" ]; then
+            pickle_files=$(find models -type f \( -name "*.pkl" -o -name "*.pickle" -o -name "*.pt" -o -name "*.pth" -o -name "*.bin" \) 2>/dev/null)
+          else
+            pickle_files=""
+          fi
+ 
+          if [ -z "$pickle_files" ]; then
+            echo "No candidate pickle-based files found under models/."
+          fi
+ 
+          for f in $pickle_files; do
+            safe_name=$(echo "$f" | tr '/.' '__')
+            python3 -m fickling --check-safety \
+              --json-output "fickling-reports/${safe_name}.json" \
+              "$f" || true
+            # tag each report with its source file path
+            python3 - "$f" "fickling-reports/${safe_name}.json" <<'PYEOF'
+          import json, sys
+          src, path = sys.argv[1], sys.argv[2]
+          try:
+              with open(path) as fh:
+                  data = json.load(fh)
+          except FileNotFoundError:
+              data = {"severity": "ERROR", "analysis": "Fickling produced no output for this file."}
+          data["_source_file"] = src
+          with open(path, "w") as fh:
+              json.dump(data, fh)
+          PYEOF
+          done
+        continue-on-error: true
+ 
+      - name: Convert Fickling JSON reports to SARIF
+        run: |
+          python - <<'PYEOF'
+          import json
+          import glob
+ 
+          rules = {
+              "fickling-unsafe-pickle": {
+                  "id": "fickling-unsafe-pickle",
+                  "name": "fickling-unsafe-pickle",
+                  "shortDescription": {"text": "Pickle file flagged as likely unsafe by Fickling"},
+                  "fullDescription": {
+                      "text": "Fickling performs static opcode-level analysis of pickle "
+                              "files and flags structural patterns associated with "
+                              "malicious payloads, such as non-standard imports invoked "
+                              "during deserialization, regardless of whether the "
+                              "specific call is on a known denylist."
+                  },
+                  "helpUri": "https://github.com/trailofbits/fickling",
+                  "properties": {"security-severity": "8.0"},
+              }
+          }
+          results = []
+ 
+          for path in glob.glob("fickling-reports/*.json"):
+              with open(path) as f:
+                  data = json.load(f)
+ 
+              severity = data.get("severity", "UNKNOWN")
+              if severity in ("LIKELY_UNSAFE", "UNSAFE", "ERROR"):
+                  analysis = data.get("analysis", "Fickling flagged this pickle file as unsafe.")
+                  source = data.get("_source_file", path)
+ 
+                  results.append({
+                      "ruleId": "fickling-unsafe-pickle",
+                      "level": "error",
+                      "message": {"text": f"[{severity}] {analysis}"},
+                      "locations": [{
+                          "physicalLocation": {
+                              "artifactLocation": {"uri": source},
+                              "region": {"startLine": 1}
+                          }
+                      }]
+                  })
+ 
+          sarif = {
+              "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "Fickling",
+                          "informationUri": "https://github.com/trailofbits/fickling",
+                          "rules": list(rules.values()),
+                      }
+                  },
+                  "results": results,
+              }],
+          }
+ 
+          with open("fickling-results.sarif", "w") as f:
+              json.dump(sarif, f, indent=2)
+ 
+          print(f"Converted {len(results)} Fickling finding(s) to SARIF.")
+          PYEOF
+        continue-on-error: true
+ 
+      - name: Upload Fickling SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: fickling-results.sarif
+          category: fickling
+ 
+  model-scan-summary:
+    name: Model Scan Summary
+    runs-on: ubuntu-latest
+    needs: [modelscan, fickling]
+    if: always()
+    steps:
+      - name: Report model scan status
+        run: |
+          echo "## Model Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- ModelScan (known-bad operator denylist): ${{ needs.modelscan.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Fickling (pickle opcode structural analysis): ${{ needs.fickling.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Note: these two tools catch different things. ModelScan flags calls" >> $GITHUB_STEP_SUMMARY
+          echo "to known-dangerous functions (os.system, eval, subprocess, etc)." >> $GITHUB_STEP_SUMMARY
+          echo "Fickling flags the structural pattern of any non-standard import" >> $GITHUB_STEP_SUMMARY
+          echo "invoked during unpickling, even if the function itself is unfamiliar." >> $GITHUB_STEP_SUMMARY
+          echo "Findings are available under the repo's Security > Code scanning tab." >> $GITHUB_STEP_SUMMARY
