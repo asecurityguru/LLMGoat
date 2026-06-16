@@ -1,4 +1,5 @@
 FROM python:3.10-slim
+RUN apt-get update && apt-get upgrade -y perl-modules-5.40 && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
 WORKDIR /app
